@@ -1,0 +1,5 @@
+/build/
+/output/frames/*.png
+.vscode/
+.DS_Store
+*.swp
