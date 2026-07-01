@@ -19,13 +19,17 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdio>
+#include <cmath>
 
 struct RenderSettings {
     int   width             = 1280;
     int   height            = 720;
     int   samples_per_pixel = 64;
     int   max_depth         = 12;
-    Color sky_top           = Color(0.50f, 0.70f, 1.00f); // gradient fallback when no HDR
+    Color sky_top           = Color(0.50f, 0.70f, 1.00f); // gradient top    (no-HDR fallback)
+    Color sky_bottom        = Color(1.00f, 1.00f, 1.00f); // gradient horizon (no-HDR fallback)
+    float exposure          = 1.0f;                       // multiplies radiance before tone map
+    float clamp_radiance    = 0.0f;                        // >0 clamps per-sample radiance (kills fireflies)
     const Environment* env  = nullptr;                    // if set, used instead of gradient
 };
 
@@ -51,7 +55,7 @@ inline Color ray_color(const Ray& r, const Hittable& world,
         // Fallback: vertical sky gradient.
         Vec3  unit = normalize(r.dir);
         float a    = 0.5f * (unit.y + 1.0f);
-        return (1.0f - a) * Color(1, 1, 1) + a * cfg.sky_top;
+        return (1.0f - a) * cfg.sky_bottom + a * cfg.sky_top;
     }
 
     Color emitted = rec.mat->emitted(rec.u, rec.v, rec.p);
@@ -87,10 +91,20 @@ inline void render(const Hittable& world, const Camera& cam,
             for (int s = 0; s < cfg.samples_per_pixel; ++s) {
                 float u = (i + random_float()) / (cfg.width  - 1);
                 float v = (j + random_float()) / (cfg.height - 1);
-                col += ray_color(cam.generate_ray(u, v), world, cfg, cfg.max_depth);
+                Color sample = ray_color(cam.generate_ray(u, v), world, cfg, cfg.max_depth);
+                // Drop non-finite samples (NaN/Inf) so a single bad path can't
+                // corrupt the average into garbage colors.
+                if (!(std::isfinite(sample.x) && std::isfinite(sample.y) && std::isfinite(sample.z)))
+                    sample = Color(0, 0, 0);
+                if (cfg.clamp_radiance > 0.0f) {   // tame fireflies from tiny bright emitters
+                    sample.x = std::fmin(sample.x, cfg.clamp_radiance);
+                    sample.y = std::fmin(sample.y, cfg.clamp_radiance);
+                    sample.z = std::fmin(sample.z, cfg.clamp_radiance);
+                }
+                col += sample;
             }
             col = col / static_cast<float>(cfg.samples_per_pixel);
-            col = gamma_correct(aces_tonemap(col));   // tone map, then gamma
+            col = gamma_correct(aces_tonemap(col * cfg.exposure));   // tone map, then gamma
 
             // Flip vertically: screen v=0 is the bottom, PNG row 0 is the top.
             std::size_t idx = (static_cast<std::size_t>(cfg.height - 1 - j) * cfg.width + i) * 3;

@@ -1,12 +1,9 @@
 // ---------------------------------------------------------------------------
-// main.cpp — Animated short: orbiting camera over a ring of spheres.
-//   Renders an image sequence (output/frames/frame_XXXX.png) that ffmpeg
-//   stitches into a video. Camera path + depth of field are keyframed.
+// main.cpp — "The Bridge Between Worlds" — Milestone 1: bridge geometry.
+//   Lit with the studio HDR for now; night sky + lanterns come next.
 // ---------------------------------------------------------------------------
 #include <iostream>
 #include <vector>
-#include <chrono>
-#include <cstdio>
 #include <cmath>
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -19,100 +16,91 @@
 #include "vec3.h"
 #include "camera.h"
 #include "sphere.h"
+#include "shapes.h"
 #include "material.h"
 #include "texture.h"
+#include "bvh.h"
 #include "environment.h"
-#include "animation.h"
 #include "renderer.h"
 
+using Obj = std::vector<std::shared_ptr<Hittable>>;
+
+// Stone with slight per-instance color variation for texture variety.
+static std::shared_ptr<Material> stone() {
+    float n = random_float(-0.05f, 0.05f);
+    return std::make_shared<Lambertian>(Color(0.36f + n, 0.31f + n, 0.26f + n));
+}
+
+// Procedural stone bridge: deck + railings + posts + arches + abutments.
+static void buildBridge(Obj& w) {
+    const float halfW = 1.2f, z0 = -12.0f, z1 = 12.0f, deckTop = 0.2f;
+
+    // Deck slab, split into segments so the stone color varies along it.
+    const int segs = 12;
+    for (int i = 0; i < segs; ++i) {
+        float za = z0 + (z1 - z0) * i / segs, zb = z0 + (z1 - z0) * (i + 1) / segs;
+        w.push_back(std::make_shared<Box>(Vec3(-halfW, 0.0f, za), Vec3(halfW, deckTop, zb), stone()));
+    }
+    // Side railing walls.
+    for (int s = -1; s <= 1; s += 2) {
+        float xc = s * 1.125f;
+        w.push_back(std::make_shared<Box>(Vec3(xc - 0.075f, deckTop, z0),
+                                          Vec3(xc + 0.075f, deckTop + 0.35f, z1), stone()));
+    }
+    // Railing posts.
+    for (float z = z0 + 0.8f; z < z1; z += 1.7f)
+        for (int s = -1; s <= 1; s += 2) {
+            float xc = s * 1.125f;
+            w.push_back(std::make_shared<Box>(Vec3(xc - 0.09f, deckTop, z - 0.09f),
+                                              Vec3(xc + 0.09f, deckTop + 0.55f, z + 0.09f), stone()));
+        }
+    // Two underside arches, each 8 cylinder segments forming a downward curve.
+    const int A = 8; const float archSpan = 6.0f, archH = 2.0f, ar = 0.14f;
+    for (int s = -1; s <= 1; s += 2) {
+        float xa = s * 1.0f;
+        Point3 prev;
+        for (int k = 0; k <= A; ++k) {
+            float phi = PI * k / A;
+            Point3 p(xa, -archH * std::sin(phi), -archSpan * std::cos(phi));
+            if (k > 0) w.push_back(std::make_shared<Cylinder>(prev, p, ar, stone()));
+            prev = p;
+        }
+    }
+    // Abutment blocks at the banks + small central piers.
+    w.push_back(std::make_shared<Box>(Vec3(-halfW, -2.6f, z0), Vec3(halfW, 0.0f, z0 + 1.4f), stone()));
+    w.push_back(std::make_shared<Box>(Vec3(-halfW, -2.6f, z1 - 1.4f), Vec3(halfW, 0.0f, z1), stone()));
+    for (int s = -1; s <= 1; s += 2) {
+        float xa = s * 1.0f;
+        w.push_back(std::make_shared<Cylinder>(Point3(xa, -2.4f, 0), Point3(xa, -2.0f, 0), 0.18f, stone()));
+    }
+}
+
 int main() {
-    // ---- Film settings -----------------------------------------------------
-    const int   WIDTH   = 1280;
-    const int   HEIGHT  = 720;
-    const int   SPP     = 64;
-    const int   DEPTH   = 16;
-    const int   FPS     = 24;
-    const float DURATION= 4.0f;                 // seconds
-    const int   FRAMES  = int(FPS * DURATION);  // 96
-
     RenderSettings cfg;
-    cfg.width = WIDTH; cfg.height = HEIGHT;
-    cfg.samples_per_pixel = SPP; cfg.max_depth = DEPTH;
+    cfg.width = 1280; cfg.height = 720;
+    cfg.samples_per_pixel = 64;   // lower for faster previews
+    cfg.max_depth = 16;
 
-    // ---- Environment -------------------------------------------------------
     Environment env;
     if (env.load("assets/hdri/studio.hdr")) { env.intensity = 1.0f; cfg.env = &env; }
-    else std::cerr << "No HDRI - using gradient sky.\n";
+    else std::cerr << "No HDRI - gradient sky.\n";
 
-    // ---- Scene: glass hero + a ring of colored / metal / glass spheres -----
-    HittableList world;
-    auto checker = std::make_shared<CheckerTexture>(Color(0.16f,0.20f,0.22f),
-                                                    Color(0.86f,0.87f,0.90f), 2.2f);
-    world.add(std::make_shared<Sphere>(Point3(0,-100.5f,0), 100.0f,
-              std::make_shared<Lambertian>(checker)));
+    Obj w;
+    // Water / ground plane.
+    w.push_back(std::make_shared<Quad>(Point3(-30, -2.6f, -30), Vec3(60, 0, 0), Vec3(0, 0, 60),
+                std::make_shared<Lambertian>(Color(0.18f, 0.20f, 0.22f))));
+    buildBridge(w);
 
-    // Hero glass sphere at the centre (rests on the floor).
-    world.add(std::make_shared<Sphere>(Point3(0,0.0f,0), 0.5f,
-              std::make_shared<Dielectric>(1.5f)));
+    auto bvh = std::make_shared<BVHNode>(w, 0, w.size());
+    std::cerr << "Scene objects: " << w.size() << "\n";
 
-    // Palette of materials to cycle through around the ring.
-    std::vector<std::shared_ptr<Material>> palette = {
-        std::make_shared<Lambertian>(Color(0.75f,0.10f,0.15f)),  // ruby
-        std::make_shared<Metal>(Color(0.95f,0.78f,0.38f), 0.04f),// gold
-        std::make_shared<Lambertian>(Color(0.10f,0.45f,0.22f)),  // emerald
-        std::make_shared<Dielectric>(1.5f),                      // glass
-        std::make_shared<Lambertian>(Color(0.12f,0.22f,0.62f)),  // sapphire
-        std::make_shared<Metal>(Color(0.91f,0.92f,0.95f), 0.02f),// silver
-        std::make_shared<Lambertian>(Color(0.55f,0.22f,0.62f)),  // amethyst
-        std::make_shared<Metal>(Color(0.82f,0.45f,0.30f), 0.08f),// copper
-    };
+    float aspect = static_cast<float>(cfg.width) / cfg.height;
+    Point3 from(-6.5f, 2.8f, 9.0f), look(0, 0.3f, 0);
+    Camera cam(from, look, Vec3(0, 1, 0), 42.0f, aspect, 0.0f, (from - look).length());
 
-    const int   RING = 16;
-    const float Rr   = 1.35f, sr = 0.22f, sy = -0.5f + 0.22f;
-    for (int i = 0; i < RING; ++i) {
-        float a = 2.0f * PI * i / RING;
-        Point3 p(Rr*std::cos(a), sy, Rr*std::sin(a));
-        world.add(std::make_shared<Sphere>(p, sr, palette[i % palette.size()]));
-    }
-    // A few larger accent spheres for depth.
-    world.add(std::make_shared<Sphere>(Point3(-0.95f,-0.20f, 0.55f), 0.30f, palette[1]));
-    world.add(std::make_shared<Sphere>(Point3( 0.90f,-0.20f,-0.60f), 0.30f, palette[5]));
-    world.add(std::make_shared<Sphere>(Point3( 0.20f,-0.27f, 1.05f), 0.23f, palette[0]));
-
-    // ---- Keyframed camera (orbit + a gentle height dip) --------------------
-    Point3 look(0.0f, 0.05f, 0.0f);
-    AnimatedFloat angle;  angle.add(0.0f, -0.6f);  angle.add(DURATION,  1.9f); // radians swept
-    AnimatedFloat height; height.add(0.0f, 0.95f); height.add(DURATION*0.5f, 0.45f); height.add(DURATION, 0.85f);
-    AnimatedFloat radius; radius.add(0.0f, 3.4f);  radius.add(DURATION, 2.9f);        // slow push-in
-    const float vfov = 38.0f, aperture = 0.05f;
-    float aspect = float(WIDTH) / HEIGHT;
-
-    std::cerr << "Rendering " << FRAMES << " frames @ " << WIDTH << "x" << HEIGHT
-              << ", " << SPP << " spp...\n";
-    auto t_all = std::chrono::high_resolution_clock::now();
-    std::vector<unsigned char> pixels;
-
-    for (int f = 0; f < FRAMES; ++f) {
-        float t   = f / float(FPS);
-        float ang = angle.eval(t), h = height.eval(t), rad = radius.eval(t);
-        Point3 cam_pos(rad*std::cos(ang), h, rad*std::sin(ang));
-        float focus = (cam_pos - Point3(0,0,0)).length();   // keep the hero sharp
-        Camera cam(cam_pos, look, Vec3(0,1,0), vfov, aspect, aperture, focus);
-
-        auto t0 = std::chrono::high_resolution_clock::now();
-        render(world, cam, cfg, pixels);
-        auto t1 = std::chrono::high_resolution_clock::now();
-
-        char path[256];
-        std::snprintf(path, sizeof(path), "output/frames/frame_%04d.png", f);
-        stbi_write_png(path, WIDTH, HEIGHT, 3, pixels.data(), WIDTH*3);
-        std::fprintf(stderr, "  frame %3d/%d  (%.1fs)\n", f+1, FRAMES,
-                     std::chrono::duration<double>(t1-t0).count());
-    }
-    double total = std::chrono::duration<double>(
-        std::chrono::high_resolution_clock::now() - t_all).count();
-    std::cerr << "Done: " << FRAMES << " frames in " << total << " s\n";
-    std::cout << "Wrote output/frames/frame_0000.png ... frame_"
-              << (FRAMES-1) << ".png\n";
+    std::vector<unsigned char> px;
+    render(*bvh, cam, cfg, px);
+    stbi_write_png("output/bridge.png", cfg.width, cfg.height, 3, px.data(), cfg.width * 3);
+    std::cout << "Wrote output/bridge.png\n";
     return 0;
 }
